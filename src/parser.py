@@ -14,7 +14,6 @@ class Parser:
         self.session = session
         self.save_path = save_path
         self.base_url = "https://ecu-firmware-files.ru"
-        self.title = None
         if not os.path.exists(save_path):
             os.makedirs(save_path)
 
@@ -49,7 +48,7 @@ class Parser:
 
 
         soup = BeautifulSoup(html, "html.parser")
-        self.title = soup.find("h1", class_="p-title-value")
+
         container = soup.find("div", class_="block-body js-replyNewMessageContainer")
 
         if not container:
@@ -78,7 +77,6 @@ class Parser:
             authors.append(author)
             texts.append(text)
 
-        title = self.title.get_text(strip=True) if self.title else "Заголовок не найден"
         # Сбор ссылок на вложенные файлы
 
         soup = BeautifulSoup(html, "html.parser")
@@ -94,7 +92,9 @@ class Parser:
             attachments.append({"name": "", "url": download_url})
 
         title_tag = soup.select_one(".p-title .p-title-value")
-        dir_name = title_tag.text.strip() if title_tag else ""
+        title = title_tag.text.strip() if title_tag else ""
+
+        dir_name = re.sub(r'[\\/|?&"<>*]', '_', title)
 
         return {
             "title": title,
