@@ -3,17 +3,20 @@ import re
 import logging
 from urllib.parse import urlsplit, urljoin, unquote
 
+import openpyxl
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 
 
 class Parser:
-    def __init__(self, session, save_path="./"):
+    def __init__(self, session, main_url, save_path="./"):
         """Конструктор парсера."""
         self.session = session
         self.save_path = save_path
+        self.main_url = main_url
         self.base_url = "https://ecu-firmware-files.ru"
+        self.excel_path = os.path.join(self.save_path, "report.xlsx")
         if not os.path.exists(save_path):
             os.makedirs(save_path)
 
@@ -46,7 +49,6 @@ class Parser:
     def extract_articles(self, html):
         """Извлекает статьи из темы."""
 
-
         soup = BeautifulSoup(html, "html.parser")
 
         container = soup.find("div", class_="block-body js-replyNewMessageContainer")
@@ -66,10 +68,9 @@ class Parser:
         titles, authors, texts = [], [], []
 
         for article in articles:
-
             author = article.find("a", class_="username")
-            description = article.find("div", class_="bbCodeBlock-expandContent") or article.find("div", class_="bbWrapper")
-
+            description = article.find("div", class_="bbCodeBlock-expandContent") or article.find("div",
+                                                                                                  class_="bbWrapper")
 
             author = author.get_text(strip=True) if author else "Автор не найден"
             text = description.get_text("\n", strip=True) if description else "Текст не найден"
@@ -91,10 +92,28 @@ class Parser:
         if download_button and (download_url := download_button.get("href")):
             attachments.append({"name": "", "url": download_url})
 
+        new_attachments = []
+        for attachment in attachments:
+            global_file_url = urljoin(self.base_url, attachment["url"])
+            response = self.session.get(global_file_url, stream=True)
+            response.raise_for_status()
+
+            # Проверка Content-Type и Content-Disposition для различия файлов и HTML-страниц
+            content_type = response.headers.get("Content-Type", "")
+
+            if "text/html" in content_type:
+                file_info = self.get_file_info(global_file_url)
+                for file in file_info:
+                    new_attachments.append({"name": file["name"], "url": file["url"]})
+            else:
+                new_attachments.append({"name": attachment["name"], "url": attachment["url"]})
+
+        attachments = new_attachments
+
         title_tag = soup.select_one(".p-title .p-title-value")
         title = title_tag.text.strip() if title_tag else ""
 
-        dir_name = re.sub(r'[\\/|?&"<>*]', '_', title)
+        dir_name = re.sub(r'[\\/|?&"<>* :]', '_', title)
 
         return {
             "title": title,
@@ -105,11 +124,11 @@ class Parser:
             "thread_url": thread_url,
         }
 
-    def parse_forum(self, forum_url):
+    def parse_forum(self):
         """Парсит все страницы форума и сохраняет данные."""
         page_number = 1
         results = []
-
+        forum_url = self.main_url
         while forum_url:
             html = self.get_page_content(forum_url)
             if not html:
@@ -146,50 +165,61 @@ class Parser:
         self.update_report(data)
 
     def save_text_file(self, data, thread_folder):
-        """Сохраняет текстовый файл с описанием темы."""
+        """Сохраняет текстовый файл с описанием темы, избегая дубликатов."""
         txt_path = os.path.join(thread_folder, f"{data['dir_name']}.txt")
-        with open(txt_path, "a", encoding="utf-8") as f:
-            f.write(f"Ссылка на тему: {data['thread_url']}\n")
-            for author, text in zip(data["author"], data["br_text"]):
-                f.write(f"Название: {data['title']}\n")
-                f.write(f"Автор: {author}\n")
-                f.write(f"Описание:\n{text}\n")
-                f.write("\n" * 5)
 
-        print(f"✅ Текстовый файл с описанием сохранен: {txt_path}")
+        # Нормализация ссылки на тему (убираем завершающий слеш)
+        normalized_url = data['thread_url'].rstrip('/')
+
+        new_entries = []
+
+        # Формируем новые записи и объединяем их в единую строку
+        for author, text in zip(data["author"], data["br_text"]):
+            normalized_text = text.strip()  # Убираем лишние пробелы и пустые строки
+            entry = f"Ссылка на тему: {normalized_url}\nНазвание: {data['title']}\nАвтор: {author}\nОписание:\n{normalized_text}\n"
+            new_entries.append(entry)
+
+        new_content = "".join(new_entries)  # Превращаем новые записи в единую строку
+
+        # Читаем весь файл в строку
+        existing_content = ""
+        if os.path.exists(txt_path):
+            with open(txt_path, "r", encoding="utf-8") as f:
+                existing_content = f.read()
+
+        if new_content not in existing_content:
+            with open(txt_path, "a", encoding="utf-8") as f:
+                f.write(new_content)
+                f.write("\n" * 5)
+            print(f"✅ Текстовый файл с описанием сохранен: {txt_path}")
+        else:
+            print(f"⚠️ Запись уже существует, файл пропущен: {txt_path}")
 
     def download_attachments(self, data, thread_folder):
         """Загружает все вложенные файлы в тему."""
         for attachment in data["attachments"]:
-            file_url = urljoin(self.base_url, attachment["url"])
+            global_file_url = urljoin(self.base_url, attachment["url"])
             file_name = attachment["name"]
 
             try:
-                self.download_file(file_url, thread_folder, file_name)
+                if not self.check_file_url_exists(attachment["url"]):
+                    self.download_file(global_file_url, thread_folder, file_name)
+                else:
+                    print(attachment["name"],"пропущен")
             except requests.RequestException as e:
-                logging.error(f"❌ Ошибка скачивания {file_url}: {e}")
+                logging.error(f"❌ Ошибка скачивания {global_file_url}: {e}")
 
-    def download_file(self, file_url, thread_folder, file_name=""):
+    def download_file(self, global_file_url, thread_folder, file_name=""):
         """Скачивает файл по ссылке и сохраняет его на диск."""
-        response = self.session.get(file_url, stream=True)
+
+        response = self.session.get(global_file_url, stream=True)
         response.raise_for_status()
 
-        # Проверка Content-Type и Content-Disposition для различия файлов и HTML-страниц
-        content_type = response.headers.get("Content-Type", "")
-
-        if "text/html" in content_type:
-            print("+++++++++++++++++++++++++++++++")
-            file_info = self.get_file_info(file_url)
-            print(file_info)
-            for file in file_info:
-                self.download_file(file["file_url"], thread_folder, file["file_name"])
-            return
-
         # Получаем корректное имя файла
-        file_name = self.get_filename_from_headers(response.headers, file_url, file_name)
+        file_name = self.get_filename_from_headers(response.headers, global_file_url, file_name)
 
         if file_name == "reply":
-            print(f"⚠️ Пропущен файл с именем 'reply': {file_url}")
+            print(f"⚠️ Пропущен файл с именем 'reply': {global_file_url}")
             return
 
         file_path = os.path.join(thread_folder, file_name)
@@ -233,24 +263,64 @@ class Parser:
             counter += 1
         return file_path
 
+    def check_file_url_exists(self, file_url):
+        """Метод для проверки, существует ли ссылка на файл в отчете."""
+        if os.path.exists(self.excel_path):
+            df = pd.read_excel(self.excel_path)
+        else:
+            df = pd.DataFrame(
+                columns=["№", "Статус", "Название темы", "Ссылка на тему", "Ссылка на файл", "Название файла"])
+
+        # Проверяем, существует ли file_url в колонке "Ссылка на файл"
+        if file_url in df["Ссылка на файл"].values:
+            print(f"Ссылка на файл {file_url} уже существует в отчете.")
+            return True
+        else:
+            return False
+
     def update_report(self, data):
         """Обновляет отчет в Excel."""
-        excel_path = os.path.join(self.save_path, "report.xlsx")
 
-        df = pd.read_excel(excel_path) if os.path.exists(excel_path) else pd.DataFrame(
-            columns=["№", "Статус", "Название темы", "Ссылка на тему"]
+        df = pd.read_excel(self.excel_path) if os.path.exists(self.excel_path) else pd.DataFrame(
+            columns=["№", "Статус", "Название темы", "Ссылка на тему", "Ссылка на файл", "Название файла"]
         )
+        for attachment in data["attachments"]:
+            if not self.check_file_url_exists(attachment["url"]):
+                df = pd.concat([df, pd.DataFrame([{
+                    "№": len(df) + 1,
+                    "Статус": "Скачан",
+                    "Название темы": data["title"],
+                    "Ссылка на тему": data["thread_url"],
+                    "Ссылка на файл": attachment["url"],
+                    "Название файла": attachment["name"]
+                }])], ignore_index=True)
+                print(f"📊 Отчет обновлен: {self.excel_path}")
 
-        if data["thread_url"] not in df["Ссылка на тему"].values:
-            df = pd.concat([df, pd.DataFrame([{
-                "№": len(df) + 1,
-                "Статус": "Скачан",
-                "Название темы": data["title"],
-                "Ссылка на тему": data["thread_url"]
-            }])], ignore_index=True)
+        df.to_excel(self.excel_path, index=False)
 
-        df.to_excel(excel_path, index=False)
-        print(f"📊 Отчет обновлен: {excel_path}")
+        self.check_and_add_base_url()
+
+    def check_and_add_base_url(self):
+        config_sheet_name = "config"
+
+        if os.path.exists(self.excel_path):
+            workbook = openpyxl.load_workbook(self.excel_path)
+            # Проверяем, существует ли лист config, если нет - создаем его
+            if config_sheet_name not in workbook.sheetnames:
+                sheet = workbook.create_sheet(config_sheet_name)
+                # Записываем глобальный URL в первую ячейку
+                sheet.cell(row=1, column=1).value = self.main_url
+                sheet.sheet_state = "hidden"  # Скрываем лист
+            else:
+                sheet = workbook[config_sheet_name]
+                # Если URL не записан, добавляем его
+                if not sheet.cell(row=1, column=1).value:
+                    sheet.cell(row=1, column=1).value = self.main_url
+                    sheet.sheet_state = "hidden"  # Скрываем лист
+
+            workbook.save(self.excel_path)
+        else:
+            print("Файл отчета не найден!")
 
     def get_file_info(self, page_url):
         """Извлекает имя файла и ссылку для скачивания с HTML страницы."""
@@ -271,12 +341,10 @@ class Parser:
                     file_name = file_name_tag.text.strip()
                     file_url = urljoin(self.base_url, file_link_tag["href"])
 
-                    file_info.append({"file_name": file_name, "file_url": file_url})
+                    file_info.append({"name": file_name, "url": file_url})
 
             return file_info
 
         except requests.RequestException as e:
             print(f"Ошибка при получении страницы: {e}")
             return []
-
-#std_28097344_9AWAEU41_combiloader.bin
